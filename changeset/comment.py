@@ -102,7 +102,6 @@ __{GENERATED_BY_BOT_NOTE}__
         mr_iid = int(mr_iid_str)
         commit_sha = os.getenv("CI_MERGE_REQUEST_SOURCE_BRANCH_SHA", "")
 
-        self.gl.auth()
         username = self.gl.user.username
 
         has_changeset = self.has_changeset_been_added(mr_iid)
