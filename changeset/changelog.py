@@ -325,7 +325,19 @@ def get_changeset_metadata(changeset_path: Path) -> dict:
                                         pass
 
                                 key = username or c_author_name
-                                if key != pr_author:
+                                # Skip if this is the PR author — compare by
+                                # resolved username, git name, and git email so
+                                # a mismatch between git config name and GitLab
+                                # username doesn't cause a false co-author.
+                                is_author = (
+                                    key == pr_author
+                                    or c_author_name == intro_author_name
+                                    or (
+                                        intro_author_email
+                                        and c_author_email == intro_author_email
+                                    )
+                                )
+                                if not is_author:
                                     gitlab_users[key] = {
                                         "login": username,
                                         "name": c_author_name,
