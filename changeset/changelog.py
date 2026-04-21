@@ -267,6 +267,12 @@ def get_changeset_metadata(changeset_path: Path) -> dict:
 
                         metadata["pr_author"] = mr.author["username"]
                         metadata["pr_author_is_username"] = True
+                        # Record the git-level name/email we know belong to this
+                        # author so Co-authored-by trailers can be deduplicated
+                        # even when the git config name differs from the GitLab
+                        # display name.
+                        metadata["pr_author_git_name"] = intro_author_name
+                        metadata["pr_author_git_email"] = intro_author_email
                         print(
                             f"✓ Got GitLab username for MR !{mr_iid}: "
                             f"{metadata['pr_author']}"
@@ -352,6 +358,8 @@ def get_changeset_metadata(changeset_path: Path) -> dict:
                         mr_obj = project.mergerequests.get(mr.iid)
                         metadata["pr_author"] = mr_obj.author["username"]
                         metadata["pr_author_is_username"] = True
+                        metadata["pr_author_git_name"] = intro_author_name
+                        metadata["pr_author_git_email"] = intro_author_email
                         print(
                             f"✓ Got MR !{mr_iid} via commit API for "
                             f"{commit_hash[:7]}: {metadata['pr_author']}"
@@ -381,6 +389,8 @@ def get_changeset_metadata(changeset_path: Path) -> dict:
                             if u_email == intro_author_email:
                                 metadata["pr_author"] = u.username
                                 metadata["pr_author_is_username"] = True
+                                metadata["pr_author_git_name"] = intro_author_name
+                                metadata["pr_author_git_email"] = intro_author_email
                                 print(
                                     f"✓ Resolved username by email: "
                                     f"{u.username}"
@@ -397,6 +407,8 @@ def get_changeset_metadata(changeset_path: Path) -> dict:
                         if len(found) == 1:
                             metadata["pr_author"] = found[0].username
                             metadata["pr_author_is_username"] = True
+                            metadata["pr_author_git_name"] = intro_author_name
+                            metadata["pr_author_git_email"] = intro_author_email
                             print(
                                 f"✓ Resolved username by display name "
                                 f"'{intro_author_name}': {found[0].username}"
@@ -416,6 +428,10 @@ def get_changeset_metadata(changeset_path: Path) -> dict:
             # ── Co-authored-by trailers ───────────────────────────────────────
             co_authors_from_commits = []
             pr_author_info = metadata.get("pr_author_info", {})
+            # Git-level aliases for the PR author (git config name/email may
+            # differ from the GitLab display name, so check both).
+            pr_author_git_name = metadata.get("pr_author_git_name", "")
+            pr_author_git_email = metadata.get("pr_author_git_email", "")
 
             for line in all_commit_text.split("\n"):
                 co_author_match = re.match(
@@ -427,14 +443,14 @@ def get_changeset_metadata(changeset_path: Path) -> dict:
 
                     is_pr_author = (
                         co_author_name == metadata.get("pr_author")
-                        or (
-                            pr_author_info
-                            and co_author_email == pr_author_info.get("email", "")
-                        )
-                        or (
-                            pr_author_info
-                            and co_author_name == pr_author_info.get("name", "")
-                        )
+                        or (pr_author_git_email
+                            and co_author_email == pr_author_git_email)
+                        or (pr_author_git_name
+                            and co_author_name == pr_author_git_name)
+                        or (pr_author_info
+                            and co_author_email == pr_author_info.get("email", ""))
+                        or (pr_author_info
+                            and co_author_name == pr_author_info.get("name", ""))
                     )
 
                     if co_author_name and not is_pr_author:
