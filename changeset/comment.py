@@ -118,7 +118,16 @@ __{GENERATED_BY_BOT_NOTE}__
 
 def comment():
     """Post or update a changeset status comment on the current MR."""
-    token = os.getenv("GITLAB_TOKEN") or os.getenv("CI_JOB_TOKEN")
     server_url = os.getenv("CI_SERVER_URL", "https://gitlab.com")
-    gl = gitlab.Gitlab(url=server_url, private_token=token)
+    private_token = os.getenv("GITLAB_TOKEN")
+    
+    if private_token:
+        gl = gitlab.Gitlab(url=server_url, private_token=private_token)
+    else:
+        print(
+            "[pychangeset:comment] No token found. Set GITLAB_TOKEN or CI_JOB_TOKEN.",
+            file=sys.stderr,
+        )
+        return
+
     Comment(gl).run()
