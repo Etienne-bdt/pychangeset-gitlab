@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Changelog generation integrated with version bumping.
-Generates changelogs with PR metadata and creates PR descriptions.
+Generates changelogs with MR metadata and creates MR descriptions.
 """
 
 import json
@@ -11,6 +11,7 @@ import subprocess
 from pathlib import Path
 
 import click
+import gitlab
 
 # Import from changeset.py to reuse logic
 from changeset.changeset import (
@@ -38,7 +39,7 @@ def load_config() -> dict:
 
 
 def get_git_info() -> dict:
-    """Get git information for the current commit/PR."""
+    """Get git information for the current commit/MR."""
     info = {}
 
     # Get the current commit hash
@@ -50,7 +51,20 @@ def get_git_info() -> dict:
     except Exception:
         info["commit"] = None
 
-    # Get GitHub repo info
+    # Use GitLab CI environment variables when available (pipeline runs).
+    # CI_PROJECT_URL already contains the full project URL including the host,
+    # so we can skip remote parsing entirely in that case.
+    ci_project_url = os.environ.get("CI_PROJECT_URL")
+    ci_server_url = os.environ.get("CI_SERVER_URL")
+    ci_project_path = os.environ.get("CI_PROJECT_PATH")
+    if ci_project_url and ci_server_url and ci_project_path:
+        info["repo_url"] = ci_project_url
+        info["gitlab_url"] = ci_server_url
+        info["project_path"] = ci_project_path
+        return info
+
+    # Fall back to parsing the git remote URL (local / user-launched runs).
+    # Supports both self-hosted instances and gitlab.com.
     try:
         result = subprocess.run(
             ["git", "remote", "get-url", "origin"],
@@ -59,25 +73,65 @@ def get_git_info() -> dict:
             check=True,
         )
         remote_url = result.stdout.strip()
-        # Extract owner/repo from URL
-        match = re.search(r"github\.com[:/]([^/]+)/([^/]+?)(?:\.git)?$", remote_url)
-        if match:
-            info["owner"] = match.group(1)
-            info["repo"] = match.group(2)
-            info["repo_url"] = f"https://github.com/{info['owner']}/{info['repo']}"
+        # HTTPS: https://gitlab.example.com/namespace/subgroup/project.git
+        https_match = re.match(r"https?://([^/]+)/(.+?)(?:\.git)?$", remote_url)
+        # SSH:   git@gitlab.example.com:namespace/subgroup/project.git
+        ssh_match = re.match(r"git@([^:]+):(.+?)(?:\.git)?$", remote_url)
+        m = https_match or ssh_match
+        if m:
+            host = m.group(1)
+            path = m.group(2)
+            info["gitlab_url"] = f"https://{host}"
+            info["project_path"] = path
+            info["repo_url"] = f"https://{host}/{path}"
     except Exception:
         pass
 
     return info
 
 
+def _get_gitlab_client(gitlab_url: str) -> "gitlab.Gitlab | None":
+    """Create an authenticated GitLab client.
+
+    Supports both a personal/project access token (GITLAB_TOKEN / PRIVATE_TOKEN)
+    and a CI job token (CI_JOB_TOKEN), so the same code works for local runs and
+    GitLab CI pipelines on any self-hosted or gitlab.com instance.
+    """
+    private_token = os.environ.get("GITLAB_TOKEN") or os.environ.get("PRIVATE_TOKEN")
+    job_token = os.environ.get("CI_JOB_TOKEN")
+    try:
+        if private_token:
+            gl = gitlab.Gitlab(gitlab_url, private_token=private_token)
+        elif job_token:
+            gl = gitlab.Gitlab(gitlab_url, job_token=job_token)
+        else:
+            return None
+        gl.auth()
+        return gl
+    except Exception:
+        return None
+
+
 def get_pr_metadata() -> dict:
-    """Get PR metadata from environment or git."""
+    """Get MR metadata from GitLab CI environment or git."""
     metadata = {
-        "pr_number": os.environ.get("PR_NUMBER"),
-        "pr_author": os.environ.get("PR_AUTHOR"),
-        "commit_hash": os.environ.get("COMMIT_SHA", ""),
+        # GitLab CI exposes CI_MERGE_REQUEST_IID; fallback to MR_NUMBER for
+        # user-launched scripts
+        "pr_number": (
+            os.environ.get("CI_MERGE_REQUEST_IID") or os.environ.get("MR_NUMBER")
+        ),
+        # GitLab CI exposes GITLAB_USER_LOGIN; fallback to MR_AUTHOR for
+        # user-launched scripts
+        "pr_author": (
+            os.environ.get("GITLAB_USER_LOGIN") or os.environ.get("MR_AUTHOR")
+        ),
+        "commit_hash": (
+            os.environ.get("CI_COMMIT_SHA") or os.environ.get("COMMIT_SHA", "")
+        ),
     }
+
+    if metadata["pr_author"]:
+        metadata["pr_author_is_username"] = True
 
     # Always get git info for repo URL
     git_info = get_git_info()
@@ -93,9 +147,11 @@ def get_pr_metadata() -> dict:
 
 
 def get_changeset_metadata(changeset_path: Path) -> dict:
-    """Get PR metadata for a specific changeset file.
+    """Get MR metadata for a specific changeset file.
 
-    Finds the commit that introduced the changeset and extracts metadata.
+    Finds the commit that introduced the changeset and extracts metadata
+    using the GitLab API (python-gitlab).  Works on self-hosted instances
+    and gitlab.com; works both in CI pipelines and local user runs.
     """
     metadata = {}
     git_info = get_git_info()
@@ -114,7 +170,7 @@ def get_changeset_metadata(changeset_path: Path) -> dict:
             commit_hash = result.stdout.strip().split("\n")[0]
             metadata["commit_hash"] = commit_hash
 
-            # Get the commit message to extract PR number and co-authors
+            # Get the commit message to extract MR IID and co-authors
             msg_result = subprocess.run(
                 ["git", "log", "-1", "--format=%B", commit_hash],
                 capture_output=True,
@@ -124,141 +180,110 @@ def get_changeset_metadata(changeset_path: Path) -> dict:
 
             commit_msg = msg_result.stdout.strip()
 
-            # Extract PR number from commit message (common patterns)
-            # Pattern 1: (#123)
-            # Pattern 2: Merge pull request #123
-            pr_match = re.search(r"(?:#|pull request #)(\d+)", commit_msg)
-            if pr_match:
-                pr_number = pr_match.group(1)
-                metadata["pr_number"] = pr_number
+            # Extract MR IID from GitLab merge-commit messages.
+            # GitLab writes "See merge request namespace/project!123" in the
+            # merge-commit body, so "!(\d+)" is a reliable anchor.
+            mr_match = re.search(r"!(\d+)", commit_msg)
+            if mr_match:
+                mr_iid = mr_match.group(1)
+                metadata["pr_number"] = mr_iid
 
-                # Try to get PR author using GitHub CLI if available
-                try:
-                    # Check if we're in GitHub Actions and have a token
-                    gh_token = os.environ.get("GITHUB_TOKEN") or os.environ.get(
-                        "GH_TOKEN"
-                    )
+                gitlab_url = git_info.get("gitlab_url", "https://gitlab.com")
+                project_path = git_info.get("project_path", "")
 
-                    cmd = [
-                        "gh",
-                        "api",
-                        f"repos/{git_info.get('owner', '')}/"
-                        f"{git_info.get('repo', '')}/pulls/{pr_number}",
-                        "--jq",
-                        ".user.login",
-                    ]
+                gl = _get_gitlab_client(gitlab_url)
+                if gl and project_path:
+                    try:
+                        project = gl.projects.get(project_path)
+                        mr = project.mergerequests.get(int(mr_iid))
 
-                    env = os.environ.copy()
-                    if gh_token:
-                        env["GH_TOKEN"] = gh_token
-
-                    gh_result = subprocess.run(
-                        cmd,
-                        capture_output=True,
-                        text=True,
-                        check=True,
-                        env=env,
-                    )
-                    if gh_result.stdout.strip():
-                        metadata["pr_author"] = gh_result.stdout.strip()
+                        # Get MR author username
+                        metadata["pr_author"] = mr.author["username"]
                         metadata["pr_author_is_username"] = True
                         print(
-                            f"✓ Got GitHub username for PR #{pr_number}: "
+                            f"✓ Got GitLab username for MR !{mr_iid}: "
                             f"{metadata['pr_author']}"
                         )
 
-                    # Also try to get PR author's full info for better deduplication
-                    pr_author_info = {}
-                    if metadata.get("pr_author") and metadata.get(
-                        "pr_author_is_username"
-                    ):
+                        # Try to get author's full info for co-author deduplication
+                        pr_author_info: dict = {}
                         try:
-                            cmd = [
-                                "gh",
-                                "api",
-                                f"users/{metadata['pr_author']}",
-                            ]
-                            user_result = subprocess.run(
-                                cmd,
-                                capture_output=True,
-                                text=True,
-                                check=True,
-                                env=env,
-                            )
-                            if user_result.stdout.strip():
-                                import json
-
-                                user_data = json.loads(user_result.stdout)
+                            users = gl.users.list(username=metadata["pr_author"])
+                            if users:
+                                user = users[0]
                                 pr_author_info = {
                                     "login": metadata["pr_author"],
-                                    "name": user_data.get("name", ""),
-                                    "email": user_data.get("email", ""),
+                                    "name": getattr(user, "name", ""),
+                                    "email": (
+                                        getattr(user, "public_email", "")
+                                        or getattr(user, "email", "")
+                                    ),
                                 }
                                 metadata["pr_author_info"] = pr_author_info
                         except Exception:
                             pass
 
-                    # Also try to get co-authors from PR commits
-                    try:
-                        # Get all commits in the PR with full author info
-                        cmd = [
-                            "gh",
-                            "api",
-                            f"repos/{git_info.get('owner', '')}/"
-                            f"{git_info.get('repo', '')}/pulls/{pr_number}/commits",
-                        ]
+                        # Get co-authors from MR commits; try to resolve usernames
+                        try:
+                            pr_author = metadata["pr_author"]
+                            gitlab_users: dict = {}
 
-                        commits_result = subprocess.run(
-                            cmd,
+                            for c in mr.commits():
+                                author_name = getattr(c, "author_name", "")
+                                author_email = getattr(c, "author_email", "")
+                                if not author_name:
+                                    continue
+
+                                # Try to resolve a GitLab username via e-mail search
+                                username = None
+                                try:
+                                    found = gl.users.list(search=author_email)
+                                    for u in found:
+                                        u_email = (
+                                            getattr(u, "public_email", "")
+                                            or getattr(u, "email", "")
+                                        )
+                                        if u_email == author_email:
+                                            username = u.username
+                                            break
+                                except Exception:
+                                    pass
+
+                                key = username or author_name
+                                if key != pr_author:
+                                    gitlab_users[key] = {
+                                        "login": username,
+                                        "name": author_name,
+                                        "email": author_email,
+                                    }
+
+                            if gitlab_users:
+                                metadata["co_authors"] = [
+                                    (key, info["login"] is not None)
+                                    for key, info in gitlab_users.items()
+                                ]
+                                # Reuse key name for deduplication logic below
+                                metadata["github_user_info"] = gitlab_users
+                        except Exception:
+                            pass
+
+                    except Exception as e:
+                        # GitLab API failed — fall back to git commit author name
+                        print(f"⚠️  GitLab API failed for MR !{mr_iid}: {e!s}")
+                        author_result = subprocess.run(
+                            ["git", "log", "-1", "--format=%an", commit_hash],
                             capture_output=True,
                             text=True,
-                            check=True,
-                            env=env,
                         )
-                        if commits_result.stdout.strip():
-                            commits_data = json.loads(commits_result.stdout)
-
-                            # Build a map of GitHub usernames to their info
-                            github_users = {}
-                            for commit in commits_data:
-                                author = commit.get("author")
-                                if author and author.get("login"):
-                                    username = author["login"]
-                                    pr_author = metadata.get("pr_author")
-                                    if username and username != pr_author:
-                                        commit_data = commit.get("commit", {})
-                                        commit_author = commit_data.get("author", {})
-                                        github_users[username] = {
-                                            "login": username,
-                                            "name": commit_author.get("name", ""),
-                                            "email": commit_author.get("email", ""),
-                                        }
-
-                            if github_users:
-                                metadata["co_authors"] = list(github_users.keys())
-                                metadata["co_authors_are_usernames"] = True
-                                # Store the full user info for deduplication later
-                                metadata["github_user_info"] = github_users
-                    except Exception:
-                        pass
-
-                except Exception as e:
-                    # If gh command fails, try to extract from commit author
-                    print(f"⚠️  GitHub CLI failed for PR #{pr_number}: {e!s}")
-                    author_result = subprocess.run(
-                        ["git", "log", "-1", "--format=%an", commit_hash],
-                        capture_output=True,
-                        text=True,
-                    )
-                    if author_result.stdout.strip():
-                        metadata["pr_author"] = author_result.stdout.strip()
-                        metadata["pr_author_is_username"] = False
-                        print(
-                            f"⚠️  Using git author name for PR #{pr_number}: "
-                            f"{metadata['pr_author']} (no @ will be added)"
-                        )
+                        if author_result.stdout.strip():
+                            metadata["pr_author"] = author_result.stdout.strip()
+                            metadata["pr_author_is_username"] = False
+                            print(
+                                f"⚠️  Using git author name for MR !{mr_iid}: "
+                                f"{metadata['pr_author']} (no @ will be added)"
+                            )
             else:
-                # No PR number found, use commit author
+                # No MR IID found — use the git commit author name
                 author_result = subprocess.run(
                     ["git", "log", "-1", "--format=%an", commit_hash],
                     capture_output=True,
@@ -268,7 +293,7 @@ def get_changeset_metadata(changeset_path: Path) -> dict:
                     metadata["pr_author"] = author_result.stdout.strip()
                     metadata["pr_author_is_username"] = False
 
-            # Extract co-authors from commit message
+            # Extract co-authors from Co-authored-by trailers in the commit message
             co_authors_from_commits = []
             pr_author_info = metadata.get("pr_author_info", {})
 
@@ -280,7 +305,7 @@ def get_changeset_metadata(changeset_path: Path) -> dict:
                     co_author_name = co_author_match.group(1).strip()
                     co_author_email = co_author_match.group(2).strip()
 
-                    # Check if this co-author is actually the PR author
+                    # Check if this co-author is actually the MR author
                     is_pr_author = False
 
                     # Direct username match
@@ -302,20 +327,16 @@ def get_changeset_metadata(changeset_path: Path) -> dict:
                             {"name": co_author_name, "email": co_author_email}
                         )
 
-            # Deduplicate co-authors using GitHub user info
+            # Deduplicate co-authors using gitlab_user_info
             if "co_authors" in metadata and metadata.get("github_user_info"):
-                # We have GitHub users - check if commit co-authors match
-                github_users = metadata.get("github_user_info", {})
-                final_co_authors = []
+                # We have GitLab users — check if commit co-authors match
+                gitlab_users = metadata.get("github_user_info", {})
+                final_co_authors = list(metadata["co_authors"])
 
-                # Add all GitHub users
-                for username in metadata["co_authors"]:
-                    final_co_authors.append((username, True))
-
-                # Check commit co-authors against GitHub users
+                # Check commit co-authors against GitLab users
                 for commit_author in co_authors_from_commits:
                     is_duplicate = False
-                    for username, user_info in github_users.items():
+                    for _key, user_info in gitlab_users.items():
                         # Check by email (most reliable)
                         if commit_author["email"] == user_info.get("email", ""):
                             is_duplicate = True
@@ -326,12 +347,12 @@ def get_changeset_metadata(changeset_path: Path) -> dict:
                             break
 
                     if not is_duplicate:
-                        # This is a unique co-author not in GitHub commits
+                        # This is a unique co-author not found in GitLab commits
                         final_co_authors.append((commit_author["name"], False))
 
                 metadata["co_authors"] = final_co_authors
             elif co_authors_from_commits:
-                # No GitHub API data - just use commit co-authors
+                # No GitLab API data — just use commit co-authors
                 metadata["co_authors"] = [
                     (author["name"], False) for author in co_authors_from_commits
                 ]
@@ -340,17 +361,24 @@ def get_changeset_metadata(changeset_path: Path) -> dict:
         # If git commands fail, return empty metadata
         pass
 
-    # Fall back to environment variables if no specific metadata found
+    # Fall back to GitLab CI / user-supplied environment variables
     if not metadata.get("pr_number"):
-        metadata["pr_number"] = os.environ.get("PR_NUMBER", "")
+        metadata["pr_number"] = (
+            os.environ.get("CI_MERGE_REQUEST_IID")
+            or os.environ.get("MR_NUMBER", "")
+        )
     if not metadata.get("pr_author"):
-        metadata["pr_author"] = os.environ.get("PR_AUTHOR", "")
-        # Assume env var contains username if it exists
+        metadata["pr_author"] = (
+            os.environ.get("GITLAB_USER_LOGIN")
+            or os.environ.get("MR_AUTHOR", "")
+        )
+        # Assume env var contains a username if it exists
         if metadata["pr_author"]:
             metadata["pr_author_is_username"] = True
     if not metadata.get("commit_hash"):
         metadata["commit_hash"] = os.environ.get(
-            "COMMIT_SHA", git_info.get("commit", "")
+            "CI_COMMIT_SHA",
+            os.environ.get("COMMIT_SHA", git_info.get("commit", "")),
         )
 
     return metadata
@@ -374,13 +402,13 @@ def format_changelog_entry(entry: dict, config: dict, pr_metadata: dict) -> str:
     # Build the entry
     parts = []
 
-    # Add PR link if available
+    # Add MR link if available
     if pr_number and repo_url:
-        parts.append(f"[#{pr_number}]({repo_url}/pull/{pr_number})")
+        parts.append(f"[!{pr_number}]({repo_url}/-/merge_requests/{pr_number})")
 
     # Add commit link if available
     if commit_hash and repo_url:
-        parts.append(f"[`{commit_hash}`]({repo_url}/commit/{commit_hash})")
+        parts.append(f"[`{commit_hash}`]({repo_url}/-/commit/{commit_hash})")
 
     # Add author thanks if available
     authors_to_thank = []
@@ -644,7 +672,7 @@ def main(dry_run: bool, output_pr_description: str):
             click.style("\n🔍 Dry run mode - no changes will be made", fg="yellow")
         )
         click.echo("\n" + "=" * 60)
-        click.echo(click.style("PR Description:", fg="cyan"))
+        click.echo(click.style("MR Description:", fg="cyan"))
         click.echo("=" * 60)
         click.echo(pr_description)
         click.echo("=" * 60)
