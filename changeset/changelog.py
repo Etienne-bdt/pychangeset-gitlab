@@ -578,11 +578,11 @@ def format_changelog_entry(entry: dict, config: dict, pr_metadata: dict) -> str:
 
     if authors_to_thank:
         if len(authors_to_thank) == 1:
-            parts.append(f"Thanks {authors_to_thank[0]}!")
+            parts.append(f"by : {authors_to_thank[0]}.")
         else:
             # Format multiple authors nicely
             all_but_last = ", ".join(authors_to_thank[:-1])
-            parts.append(f"Thanks {all_but_last} and {authors_to_thank[-1]}!")
+            parts.append(f"by : {all_but_last} and {authors_to_thank[-1]}.")
 
     # Add description
     parts.append(f"- {description}")
