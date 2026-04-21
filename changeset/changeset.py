@@ -762,6 +762,15 @@ def version(dry_run: bool, skip_changelog: bool):
         )
 
 
+@cli.command(name="comment")
+def comment_cmd():
+    """Post or update a changeset status comment on the current GitLab MR."""
+    from changeset.comment import comment
+    console.print("💬 Posting changeset status comment to GitLab MR...", style="cyan bold")
+    comment()
+    console.print("🛌 Comment posted to GitLab MR, going back to sleep...", style="green bold")
+
+
 if __name__ == "__main__":
     # If no command is specified, default to 'add'
     if len(sys.argv) == 1:
