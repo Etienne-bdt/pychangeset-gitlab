@@ -11,6 +11,35 @@ RANDOM_BOT_NAME_PATTERN = re.compile(
 )
 
 
+def _get_release_plan_table() -> str:
+    """Build a markdown table of packages and their bump types from .changeset/ files."""
+    from changeset.changeset import get_changesets
+
+    changesets = get_changesets()
+    if not changesets:
+        return ""
+
+    _bump_rank = {"major": 3, "minor": 2, "patch": 1}
+    packages: dict[str, str] = {}
+    for _, package, change_type, _ in changesets:
+        current = packages.get(package)
+        if current is None or _bump_rank[change_type] > _bump_rank[current]:
+            packages[package] = change_type
+
+    labels = {"major": "Major 💥", "minor": "Minor ✨", "patch": "Patch 🐛"}
+    rows = "\n".join(
+        f"| `{pkg}` | {labels[bump]} |"
+        for pkg, bump in sorted(packages.items())
+    )
+    return (
+        "<details><summary>Packages affected</summary>\n\n"
+        "| Package | Bump type |\n"
+        "| --- | --- |\n"
+        f"{rows}\n\n"
+        "</details>"
+    )
+
+
 class Comment:
     def __init__(self, gl: gitlab.Gitlab):
         self.gl = gl
@@ -36,11 +65,14 @@ __{GENERATED_BY_BOT_NOTE}__
 """
 
     def approve_changeset_comment(self, commit_sha: str) -> str:
+        table = _get_release_plan_table()
         return f"""###  🦋  Changeset detected
 
 Latest commit: {commit_sha}
 
 **The changes in this MR will be included in the next version bump.**
+
+{table}
 
 __{GENERATED_BY_BOT_NOTE}__
 """
